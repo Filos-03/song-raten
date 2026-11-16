@@ -171,7 +171,6 @@
     <p class="muted">Du wirst zu Spotify weitergeleitet und bestätigst dort den Zugriff auf deine Playlists und die Wiedergabe.</p>
     <div class="actions">
       <button class="primary" id="loginBtn">Mit Spotify anmelden</button>
-      <button class="ghost" id="resetClientBtn">Client ID ändern</button>
     </div>
   </section>
 
@@ -287,6 +286,8 @@ if (location.hostname === 'localhost') {
   location.replace(location.href.replace('//localhost', '//127.0.0.1'));
 }
 
+// Spotify-App (Client ID ist öffentlich und kein Geheimnis)
+const CLIENT_ID = '9d51433aace144eca15b9b6614dc12e8';
 const REDIRECT_URI = location.origin + location.pathname;
 const SCOPES = [
   'streaming', 'user-read-email', 'user-read-private',
@@ -333,7 +334,7 @@ async function sha256b64url(text) {
 }
 
 async function login() {
-  const clientId = store.get('sr_client_id');
+  const clientId = CLIENT_ID;
   const verifier = randomString(64);
   const state = randomString(16);
   store.set('sr_verifier', verifier);
@@ -378,7 +379,7 @@ async function handleRedirect() {
     grant_type: 'authorization_code',
     code: q.get('code'),
     redirect_uri: REDIRECT_URI,
-    client_id: store.get('sr_client_id'),
+    client_id: CLIENT_ID,
     code_verifier: store.get('sr_verifier'),
   });
   store.del('sr_verifier'); store.del('sr_state');
@@ -393,7 +394,7 @@ async function getToken(forceRefresh = false) {
   refreshPromise ||= tokenRequest({
     grant_type: 'refresh_token',
     refresh_token: refresh,
-    client_id: store.get('sr_client_id'),
+    client_id: CLIENT_ID,
   }).finally(() => { refreshPromise = null; });
   return refreshPromise;
 }
@@ -967,7 +968,7 @@ async function loadPlaylists() {
    ========================================================= */
 $('redirectUri').textContent = REDIRECT_URI;
 $('copyRedirect').onclick = () => navigator.clipboard?.writeText(REDIRECT_URI).then(() => { $('copyRedirect').textContent = 'Kopiert ✓'; });
-$('clientIdInput').value = store.get('sr_client_id') || '';
+$('clientIdInput').value = CLIENT_ID || '';
 $('saveClientId').onclick = () => {
   const id = $('clientIdInput').value.trim();
   if (!/^[0-9a-f]{32}$/i.test(id)) return showError('Die Client ID sieht nicht richtig aus (32 Zeichen, nur 0–9 und a–f).');
@@ -976,7 +977,6 @@ $('saveClientId').onclick = () => {
   login();
 };
 $('loginBtn').onclick = login;
-$('resetClientBtn').onclick = () => { show('viewSetup'); };
 $('logoutBtn').onclick = logout;
 
 renderVolume();
@@ -1036,7 +1036,7 @@ document.addEventListener('keydown', e => {
    Start
    ========================================================= */
 (async function boot() {
-  if (!store.get('sr_client_id')) return show('viewSetup');
+  if (!CLIENT_ID) return show('viewSetup');
   try {
     await handleRedirect();
     if (!store.get('sr_refresh') && !store.get('sr_access')) return show('viewLogin');
