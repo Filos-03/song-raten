@@ -759,6 +759,23 @@ function trackFailed(e) {
   setTimeout(() => { showError(''); nextRound(); }, 900);
 }
 
+// Spotify meldet „läuft“ oft schon, während es noch lädt. Hier wird gewartet,
+// bis sich die Abspielposition wirklich bewegt – erst dann ist Ton zu hören.
+async function waitUntilAudible(s, myToken) {
+  const t0 = performance.now();
+  let base = null, baseT = 0;
+  while (myToken === snippetToken && performance.now() - t0 < 6000) {
+    const st = await player.getCurrentState().catch(() => null);
+    if (st && !st.paused && !st.loading) {
+      if (base === null) { base = st.position; baseT = performance.now(); }
+      else if (st.position > base + 15) return st;          // Position läuft → Ton ist da
+      else if (performance.now() - baseT > 1200) return st; // keine Bewegung messbar → trotzdem starten
+    }
+    await sleep(40);
+  }
+  return s;
+}
+
 async function playSnippet() {
   const c = game?.cur;
   if (!c || c.done) return;
@@ -784,6 +801,9 @@ async function playSnippet() {
       await player.resume();
       s = await started;
     }
+    if (myToken !== snippetToken) return;
+    // Erst die Zeit starten, wenn der Song wirklich klingt (Handy puffert oft noch)
+    s = await waitUntilAudible(s, myToken);
     if (myToken !== snippetToken) return;
     $('playBtn').innerHTML = '■';
     // Was bis zur Meldung schon gelaufen ist, wird vom Ausschnitt abgezogen
@@ -1044,8 +1064,13 @@ gi.onkeydown = e => {
   }
   else if (e.key === 'Escape') hideSuggest();
 };
-$('suggest').onmousedown = e => { const d = e.target.closest('[data-i]'); if (d) { e.preventDefault(); pickSuggest(Number(d.dataset.i)); gi.focus(); } };
-gi.onblur = () => setTimeout(hideSuggest, 150);
+$('suggest').onmousedown = e => { const d = e.target.closest('[data-i]'); if (d) { e.preventDefault(); pickSuggest(Number(d.dataset.i)); } };
+// Vorschläge bleiben offen, auch wenn am Handy die Tastatur zugeht.
+// Sie schließen erst beim Tippen außerhalb des Eingabefelds.
+document.addEventListener('pointerdown', e => {
+  if (!$('suggest').classList.contains('hidden') && !e.target.closest('.guess-box')) hideSuggest();
+});
+gi.onfocus = () => { if (gi.value.trim() && !gi.dataset.id) updateSuggest(); };
 
 document.addEventListener('keydown', e => {
   if ($('viewGame').classList.contains('hidden')) return;
