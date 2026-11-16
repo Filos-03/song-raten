@@ -432,16 +432,34 @@ async function api(path, opts = {}, retried = false) {
   return data;
 }
 
+// Lädt alle Seiten einer Liste – nach der ersten Seite mehrere gleichzeitig (schneller).
 async function fetchAllPages(firstPath, onProgress, cap = Infinity) {
-  let next = firstPath, items = [], total = 0;
-  while (next && items.length < cap) {
-    const page = await api(next);
-    items.push(...(page.items || []));
-    total = page.total || items.length;
-    onProgress?.(items.length, total);
-    next = page.next;
-  }
-  return items;
+  const first = await api(firstPath);
+  const items = [...(first?.items || [])];
+  const total = Math.min(first?.total ?? items.length, cap);
+  onProgress?.(items.length, total);
+  if (!first?.next || items.length >= total) return items.slice(0, cap);
+
+  const limit = first.limit || 50;
+  const offsets = [];
+  for (let o = (first.offset || 0) + limit; o < total; o += limit) offsets.push(o);
+  const pages = new Array(offsets.length);
+  let loaded = items.length, idx = 0;
+  const worker = async () => {
+    while (idx < offsets.length) {
+      const i = idx++;
+      const u = new URL(first.next);
+      u.searchParams.set('offset', offsets[i]);
+      u.searchParams.set('limit', limit);
+      const page = await api(u.toString());
+      pages[i] = page?.items || [];
+      loaded += pages[i].length;
+      onProgress?.(Math.min(loaded, total), total);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(5, offsets.length) }, worker));
+  pages.forEach(p => items.push(...p));
+  return items.slice(0, cap);
 }
 
 function toTrack(item) {
@@ -489,8 +507,15 @@ function maskMediaSession() {
   try { navigator.mediaSession.metadata = new MediaMetadata({ title: '🎵 ???', artist: 'Song-Raten' }); } catch {}
 }
 
-async function initPlayer() {
-  if (player && deviceId) return;
+// Player nur einmal anlegen; parallele Aufrufe warten auf denselben Start.
+let playerPromise = null;
+function initPlayer() {
+  if (player && deviceId) return Promise.resolve();
+  if (!playerPromise) playerPromise = initPlayerInner().catch(e => { playerPromise = null; throw e; });
+  return playerPromise;
+}
+
+async function initPlayerInner() {
   await sdkReady;
   return new Promise((resolve, reject) => {
     player = new Spotify.Player({
@@ -508,9 +533,6 @@ async function initPlayer() {
     player.addListener('player_state_changed', state => {
       lastState = state;
       maskMediaSession();
-      // Ton-Sperre: Beim Laden und Raten bleibt alles stumm (Spotify setzt die
-      // Lautstärke beim Songstart manchmal zurück – hier sofort wieder runter).
-      if (muteLock && !snippetBusy) player.setVolume(MUTE).catch(() => {});
       // Während geraten wird, darf nur der Ausschnitt laufen.
       if (guardActive && !snippetBusy && state && !state.paused) {
         player.pause().catch(() => {});
@@ -552,44 +574,29 @@ function setVolumeLevel(v) {
   if (VOLUME > 0) volBeforeMute = VOLUME;
   store.set('sr_volume', String(VOLUME));
   renderVolume();
-  // Nur sofort anwenden, wenn gerade etwas hörbar sein darf (nicht während der Rate-Sperre)
-  if (player && (!muteLock || snippetBusy)) player.setVolume(VOLUME).catch(() => {});
+  if (player) player.setVolume(VOLUME).catch(() => {});
 }
 
-// Fast 0 statt genau 0 – manche Versionen des Spotify-Players ignorieren setVolume(0).
-const MUTE = 0.0001;
-let muteLock = false;
+let guardActive = false;
 
-// Lädt den Song stumm, pausiert und springt zur Startstelle.
-async function preloadTrack(track, startMs) {
-  muteLock = true;
-  await player.setVolume(MUTE);
-  await player.pause().catch(() => {});
-  // Auch Spotify selbst die Lautstärke dieses Geräts auf 0 setzen, damit der
-  // neue Song nicht mit der alten Lautstärke startet.
-  await api(`/me/player/volume?volume_percent=0&device_id=${deviceId}`, { method: 'PUT' }).catch(() => {});
-  await player.setVolume(MUTE);
-  await sleep(100);
-  const playing = waitForState(s => !s.paused && isTrack(s, track), 10000);
+// Startet den Song der Runde an der Startstelle – erst beim ersten Play-Klick,
+// damit beim Wechsel zur nächsten Runde nichts zu hören ist.
+async function startTrack(c) {
+  const playing = waitForState(s => !s.paused && isTrack(s, c.track), 10000);
+  playing.catch(() => {});
   await api(`/me/player/play?device_id=${deviceId}`, {
     method: 'PUT',
-    body: JSON.stringify({ uris: [track.uri], position_ms: startMs }),
+    body: JSON.stringify({ uris: [c.track.uri], position_ms: c.startMs }),
   });
-  await playing;
-  player.setVolume(MUTE).catch(() => {});
-  const paused = waitForState(s => s.paused, 3000).catch(() => {});
-  await player.pause();
-  await paused;
-  await player.seek(startMs);
-  // Ab jetzt stumm & pausiert halten, bis Play gedrückt wird.
-  guardActive = true;
-  for (let i = 0; i < 6; i++) {
-    await sleep(200);
-    const s = await player.getCurrentState().catch(() => null);
-    if (s && !s.paused) { await player.pause().catch(() => {}); await player.seek(startMs).catch(() => {}); }
-  }
+  const s = await playing;
+  c.loaded = true;
+  return s;
 }
-let guardActive = false;
+function loadCurrent(c) {
+  if (!c.loadPromise) c.loadPromise = startTrack(c).catch(e => { c.loadPromise = null; throw e; });
+  return c.loadPromise;
+}
+
 
 /* =========================================================
    Spiel
@@ -679,28 +686,13 @@ async function nextRoundInner() {
     const lo = track.duration * 0.15, hi = Math.max(lo, track.duration * 0.7 - maxStage);
     startMs = Math.floor(lo + Math.random() * (hi - lo));
   }
-  game.cur = { track, startMs, stage: 0, attempts: [], done: false };
+  game.cur = { track, startMs, stage: 0, attempts: [], done: false, loaded: false, loadPromise: null };
 
+  // Vorherigen Song stoppen; der neue startet erst beim Klick auf Play.
   hideMeta = true;
-  show('viewLoading', 'Lade nächsten Song …');
-  try {
-    await preloadTrack(track, startMs);
-  } catch (e) {
-    console.warn(e);
-    muteLock = false; guardActive = false;
-    try { await player.setVolume(VOLUME); } catch {}
-    game.round--;
-    game.fails = (game.fails || 0) + 1;
-    if (game.fails >= 3) {
-      show('viewPick');
-      return showError('Die Wiedergabe startet nicht (' + esc(e.message) + ').<br>Prüfe: Spotify <b>Premium</b>? Läuft die Seite in Chrome/Edge/Firefox (nicht im privaten Fenster)? Ist im Spotify-Dashboard „Web Playback SDK“ angehakt?');
-    }
-    showError('Ein Song konnte nicht geladen werden – nehme den nächsten …');
-    await sleep(800);
-    showError('');
-    return nextRoundInner();
-  }
-  game.fails = 0;
+  guardActive = true;
+  snippetToken++; snippetBusy = false;
+  player.pause().catch(() => {});
   show('viewGame');
   $('guessArea').classList.remove('hidden');
   $('revealArea').classList.add('hidden');
@@ -752,24 +744,51 @@ function renderAttempts(ul, attempts) {
       <span>${esc(a.text)}</span><span class="t">${fmtSec(a.ms)}</span></li>`).join('');
 }
 
+function trackFailed(e) {
+  console.warn(e);
+  snippetBusy = false;
+  $('playBtn').innerHTML = '▶';
+  game.fails = (game.fails || 0) + 1;
+  if (game.fails >= 3) {
+    guardActive = false;
+    show('viewPick');
+    return showError('Die Wiedergabe startet nicht (' + esc(e.message) + ').<br>Prüfe: Spotify <b>Premium</b>? Läuft die Seite in Chrome/Edge/Firefox/Safari (nicht im privaten Fenster)? Ist im Spotify-Dashboard „Web Playback SDK“ angehakt?');
+  }
+  showError('Dieser Song lässt sich nicht abspielen – nehme einen anderen …');
+  game.round--;
+  setTimeout(() => { showError(''); nextRound(); }, 900);
+}
+
 async function playSnippet() {
-  if (!game?.cur || game.cur.done) return;
+  const c = game?.cur;
+  if (!c || c.done) return;
   const myToken = ++snippetToken;
-  const dur = game.stages[game.cur.stage];
+  const dur = game.stages[c.stage];
   const maxMs = game.stages[game.stages.length - 1];
   const fill = $('barFill');
   snippetBusy = true;
-  $('playBtn').innerHTML = '■';
+  $('playBtn').innerHTML = c.loaded ? '■' : '<span class="spinner" style="margin:0"></span>';
   try {
-    await player.pause().catch(() => {});
-    await player.seek(game.cur.startMs);
+    player.setVolume(VOLUME).catch(() => {});
+    let s;
+    if (!c.loaded) {
+      // Erster Klick der Runde: Song direkt an der Startstelle starten
+      try { s = await loadCurrent(c); }
+      catch (e) { if (myToken === snippetToken) trackFailed(e); return; }
+      game.fails = 0;
+    } else {
+      await player.pause().catch(() => {});
+      await player.seek(c.startMs);
+      if (myToken !== snippetToken) return;
+      const started = waitForState(st => !st.paused, 3000).catch(() => null);
+      await player.resume();
+      s = await started;
+    }
     if (myToken !== snippetToken) return;
-    const started = waitForState(s => !s.paused, 3000).catch(() => {});
-    await player.setVolume(VOLUME);
-    await player.resume();
-    await started;
-    if (myToken !== snippetToken) return;
-    const t0 = performance.now();
+    $('playBtn').innerHTML = '■';
+    // Was bis zur Meldung schon gelaufen ist, wird vom Ausschnitt abgezogen
+    const already = s ? Math.max(0, Math.min(dur, (s.position || 0) - c.startMs)) : 0;
+    const t0 = performance.now() - already;
     await new Promise(resolve => {
       const tick = () => {
         if (myToken !== snippetToken) return resolve();
@@ -779,9 +798,9 @@ async function playSnippet() {
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
-      setTimeout(resolve, dur + 50); // Absicherung, falls der Tab im Hintergrund ist
+      setTimeout(resolve, dur - already + 50); // Absicherung, falls der Tab im Hintergrund ist
     });
-    if (myToken === snippetToken) { await player.pause(); await player.setVolume(MUTE); }
+    if (myToken === snippetToken) await player.pause();
   } catch (e) {
     console.warn(e);
   } finally {
@@ -799,7 +818,6 @@ async function stopSnippet() {
   $('playBtn').innerHTML = '▶';
   $('barFill').style.width = '0';
   try { await player.pause(); } catch {}
-  if (muteLock) { try { await player.setVolume(MUTE); } catch {} }
 }
 
 function useChance(attempt) {
@@ -847,7 +865,6 @@ async function reveal(won) {
   c.done = true;
   await stopSnippet();
   guardActive = false;
-  muteLock = false;
   const points = won ? game.stages.length - c.stage : 0;
   game.score += points;
   game.history.push({ track: t, won, points, ms: game.stages[c.stage], tries: c.attempts.length });
@@ -869,12 +886,16 @@ async function reveal(won) {
 
   // Song ab der Startstelle weiterlaufen lassen
   hideMeta = false;
-  try { await player.seek(c.startMs); await player.setVolume(VOLUME); await player.resume(); $('pauseBtn').textContent = 'Pause'; } catch {}
+  try {
+    player.setVolume(VOLUME).catch(() => {});
+    if (c.loaded) { await player.seek(c.startMs); await player.resume(); }
+    else await loadCurrent(c);
+    $('pauseBtn').textContent = 'Pause';
+  } catch {}
 }
 
 function endGame() {
   guardActive = false;
-  muteLock = false;
   stopSnippet();
   player?.setVolume(VOLUME).catch?.(() => {});
   hideMeta = false;
@@ -979,6 +1000,9 @@ $('saveClientId').onclick = () => {
 $('loginBtn').onclick = login;
 $('logoutBtn').onclick = logout;
 
+// Handy-Browser erlauben Ton nur nach einer Berührung – bei jedem Tippen freischalten.
+document.addEventListener('click', () => { try { player?.activateElement?.(); } catch {} }, true);
+
 renderVolume();
 $('volSlider').oninput = e => setVolumeLevel(Number(e.target.value) / 100);
 $('volIcon').onclick = () => setVolumeLevel(VOLUME > 0 ? 0 : volBeforeMute);
@@ -1041,6 +1065,7 @@ document.addEventListener('keydown', e => {
     await handleRedirect();
     if (!store.get('sr_refresh') && !store.get('sr_access')) return show('viewLogin');
     await getToken();
+    initPlayer().catch(() => {}); // Player schon im Hintergrund verbinden
     await loadPlaylists();
   } catch (e) {
     console.error(e);
