@@ -121,6 +121,22 @@
   .spinner { width: 18px; height: 18px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; vertical-align: -3px; margin-right: 8px; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* Verlauf */
+  .hist-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .hist-head h2 { margin: 0; }
+  .hist-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .hist-stats div { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: 13px; color: var(--muted); }
+  .hist-stats b { display: block; color: var(--text); font-size: 18px; }
+  .hist-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .hist-row:last-child { border-bottom: 0; }
+  .hist-row .when { color: var(--muted); font-size: 12px; }
+  .hist-row .res { text-align: right; font-weight: 650; white-space: nowrap; }
+  .hist-row .meter { grid-column: 1 / -1; height: 6px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+  .hist-row .meter i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; vertical-align: 1px; }
+  .tag.endless { border-color: #6b4d12; color: var(--warn); }
+  .end-record { color: var(--warn); font-weight: 650; }
+
   @media (max-width: 520px) {
     .reveal { flex-direction: column; align-items: flex-start; }
     .grid { grid-template-columns: repeat(2, 1fr); }
@@ -185,12 +201,18 @@
       <h2>Spiel einstellen</h2>
       <div class="row">
         <div>
+          <label for="optMode">Modus</label>
+          <select id="optMode">
+            <option value="normal" selected>Normal (Runden)</option>
+            <option value="endless">Endlos</option>
+          </select>
+        </div>
+        <div id="roundsWrap">
           <label for="optRounds">Runden</label>
           <select id="optRounds">
             <option value="5">5</option>
             <option value="10" selected>10</option>
             <option value="20">20</option>
-            <option value="0">Endlos</option>
           </select>
         </div>
         <div>
@@ -205,12 +227,21 @@
           <input type="text" id="optStages" value="0.5, 1, 2, 4, 8" spellcheck="false">
         </div>
       </div>
-      <p class="muted small" style="margin:10px 0 0">Jede Hörzeit ist eine Chance: Du startest mit 0,5 s. „Länger hören“ oder ein falscher Tipp kostet eine Chance und schaltet die nächste Stufe frei.</p>
+      <p class="muted small" style="margin:10px 0 0" id="modeHelp"></p>
     </div>
     <div class="panel">
       <h2>Playlist wählen</h2>
       <input type="text" class="search" id="plSearch" placeholder="Playlist suchen …" autocomplete="off">
       <div class="grid" id="plGrid"></div>
+    </div>
+    <div class="panel">
+      <div class="hist-head">
+        <h2>Dein Verlauf</h2>
+        <button class="ghost small danger hidden" id="histClear">Verlauf löschen</button>
+      </div>
+      <div class="hist-stats" id="histStats"></div>
+      <div id="histList"></div>
+      <button class="ghost small hidden" id="histMore" style="margin-top:10px">Alle anzeigen</button>
     </div>
   </section>
 
@@ -269,6 +300,7 @@
     <h2>Spiel vorbei</h2>
     <div class="big-score" id="endScore">0</div>
     <p class="muted" id="endSummary"></p>
+    <p class="end-record hidden" id="endRecord"></p>
     <table id="endTable"></table>
     <div class="actions" style="margin-top:16px">
       <button class="primary" id="againBtn">Nochmal (gleiche Playlist)</button>
@@ -647,18 +679,22 @@ async function startGame(pl) {
   catch (e) { show('viewPick'); return showError(e.message); }
 
   const rounds = Number($('optRounds').value);
+  const endless = $('optMode').value === 'endless';
   game = {
     pl,
     tracks,
+    endless,
+    over: false,
+    savedToHistory: false,
     queue: shuffle([...tracks]),
-    totalRounds: rounds ? Math.min(rounds, tracks.length) : Infinity,
+    totalRounds: endless ? Infinity : Math.min(rounds, tracks.length),
     stages: parseStages(),
     randomStart: $('optStart').value === 'random',
     round: 0,
     score: 0,
     history: [],
   };
-  game.maxPerRound = game.stages.length;
+  game.maxPerRound = endless ? 1 : game.stages.length;
   // Vorschlagsliste (eindeutig nach Titel + Interpret)
   const map = new Map();
   tracks.forEach(t => { const k = norm(t.name) + '|' + norm(t.artists); if (!map.has(k)) map.set(k, t); });
@@ -705,7 +741,7 @@ async function nextRoundInner() {
 
 function renderGame() {
   const g = game, c = g.cur, n = g.stages.length;
-  $('roundLabel').textContent = 'Runde ' + g.round + (g.totalRounds !== Infinity ? ' / ' + g.totalRounds : '');
+  $('roundLabel').textContent = g.endless ? `Endlos · Song ${g.round}` : 'Runde ' + g.round + ' / ' + g.totalRounds;
   $('plLabel').textContent = '· ' + g.pl.name;
   $('scoreLabel').textContent = g.score;
   $('chances').innerHTML = g.stages.map((_, i) => `<i class="${i < c.stage ? 'used' : ''}"></i>`).join('');
@@ -731,7 +767,8 @@ function renderGame() {
   const cur = g.stages[c.stage];
   const remaining = n - c.stage;
   $('playBtn').innerHTML = '▶';
-  $('stageLabel').textContent = `Ausschnitt: ${fmtSec(cur)} · noch ${remaining} ${remaining === 1 ? 'Chance' : 'Chancen'} · ${remaining} ${remaining === 1 ? 'Punkt' : 'Punkte'} möglich`;
+  const pts = g.endless ? 1 : remaining;
+  $('stageLabel').textContent = `Ausschnitt: ${fmtSec(cur)} · noch ${remaining} ${remaining === 1 ? 'Chance' : 'Chancen'} · ${pts} ${pts === 1 ? 'Punkt' : 'Punkte'} möglich`;
   const isLast = c.stage >= n - 1;
   $('skipBtn').textContent = isLast ? 'Keine längere Stufe' : `Länger hören: ${fmtSec(g.stages[c.stage + 1])} (−1 Chance)`;
   $('skipBtn').disabled = isLast;
@@ -885,8 +922,10 @@ async function reveal(won) {
   c.done = true;
   await stopSnippet();
   guardActive = false;
-  const points = won ? game.stages.length - c.stage : 0;
+  const points = won ? (game.endless ? 1 : game.stages.length - c.stage) : 0;
   game.score += points;
+  // Endlos: Das Spiel endet beim ersten nicht erratenen Song
+  if (game.endless && !won) game.over = true;
   game.history.push({ track: t, won, points, ms: game.stages[c.stage], tries: c.attempts.length });
 
   $('scoreLabel').textContent = game.score;
@@ -899,9 +938,10 @@ async function reveal(won) {
   $('revAlbum').textContent = t.album;
   const badge = $('revBadge');
   badge.className = 'result-badge ' + (won ? 'win' : 'lose');
-  badge.textContent = won ? `Richtig nach ${fmtSec(game.stages[c.stage])}! +${points} ${points === 1 ? 'Punkt' : 'Punkte'}` : 'Leider nicht erraten';
+  badge.textContent = won ? `Richtig nach ${fmtSec(game.stages[c.stage])}! +${points} ${points === 1 ? 'Punkt' : 'Punkte'}`
+    : game.endless ? `Nicht erraten – Endlos-Lauf vorbei (${game.score} ${game.score === 1 ? 'Song' : 'Songs'} in Folge)` : 'Leider nicht erraten';
   renderAttempts($('revAttempts'), c.attempts);
-  $('nextBtn').textContent = (game.round >= game.totalRounds) ? 'Zum Ergebnis' : 'Nächster Song';
+  $('nextBtn').textContent = isGameFinished() ? 'Zum Ergebnis' : 'Nächster Song';
   $('nextBtn').focus();
 
   // Song ab der Startstelle weiterlaufen lassen
@@ -921,14 +961,110 @@ function endGame() {
   hideMeta = false;
   const h = game.history;
   const won = h.filter(x => x.won).length;
-  $('endScore').textContent = game.score + ' Punkte';
-  $('endSummary').textContent = `${won} von ${h.length} Songs erraten · maximal möglich: ${h.length * game.maxPerRound} Punkte`;
+  $('endScore').textContent = game.score + (game.score === 1 ? ' Punkt' : ' Punkte');
+  $('endSummary').textContent = game.endless
+    ? `Endlos-Modus: ${won} ${won === 1 ? 'Song' : 'Songs'} in Folge erraten`
+    : `${won} von ${h.length} Songs erraten · maximal möglich: ${h.length * game.maxPerRound} Punkte`;
+
+  // Rekord prüfen und im Verlauf speichern
+  const rec = $('endRecord');
+  rec.classList.add('hidden');
+  if (h.length && !game.savedToHistory) {
+    const past = loadHistory();
+    const entry = {
+      t: Date.now(), pl: game.pl.name, mode: game.endless ? 'endless' : 'normal',
+      played: h.length, won, score: game.score, max: game.endless ? null : h.length * game.maxPerRound,
+    };
+    const same = past.filter(e => e.mode === entry.mode);
+    if (same.length) {
+      const best = Math.max(...same.map(entryQuality));
+      const mine = entryQuality(entry);
+      rec.textContent = mine > best ? '🏆 Neuer Rekord!'
+        : game.endless ? `Dein Rekord im Endlos-Modus: ${best} in Folge` : `Deine beste Quote: ${best} %`;
+      rec.classList.remove('hidden');
+    }
+    saveHistory([entry, ...past]);
+    game.savedToHistory = true;
+    renderHistory();
+  }
   $('endTable').innerHTML = h.map(x => `<tr>
       <td style="width:44px">${x.track.image ? `<img src="${esc(x.track.image)}" alt="">` : ''}</td>
       <td><b>${esc(x.track.name)}</b><br><span class="muted">${esc(x.track.artists)}</span></td>
       <td style="text-align:right;white-space:nowrap">${x.won ? `✓ ${fmtSec(x.ms)}<br><span class="muted">+${x.points}</span>` : '<span style="color:var(--bad)">✗</span>'}</td>
     </tr>`).join('');
   show('viewEnd');
+}
+
+function isGameFinished() {
+  return game.over || game.round >= game.totalRounds;
+}
+
+/* =========================================================
+   Verlauf (wird in diesem Browser gespeichert, getrennt pro Spotify-Konto)
+   ========================================================= */
+let meId = null;
+let histShowAll = false;
+const histKey = () => 'sr_history_' + (meId || 'anon');
+
+function loadHistory() {
+  try { const v = JSON.parse(store.get(histKey()) || '[]'); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+function saveHistory(list) { store.set(histKey(), JSON.stringify(list.slice(0, 300))); }
+
+// Normal: Quote in %, Endlos: Songs in Folge
+function entryQuality(e) {
+  return e.mode === 'endless' ? e.score : (e.max ? Math.round(e.score / e.max * 100) : 0);
+}
+
+function fmtDate(t) {
+  return new Date(t).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' Uhr';
+}
+
+function renderHistory() {
+  const list = loadHistory();
+  $('histClear').classList.toggle('hidden', !list.length);
+  if (!list.length) {
+    $('histStats').innerHTML = '';
+    $('histList').innerHTML = '<p class="muted small" style="margin:0">Noch keine Spiele – deine Ergebnisse erscheinen hier nach dem ersten Spiel.</p>';
+    $('histMore').classList.add('hidden');
+    return;
+  }
+  const normal = list.filter(e => e.mode === 'normal');
+  const endless = list.filter(e => e.mode === 'endless');
+  const bestEndless = endless.length ? Math.max(...endless.map(e => e.score)) : null;
+  const quotes = normal.map(entryQuality);
+  const stats = [`<div><b>${list.length}</b>Spiele</div>`];
+  if (bestEndless !== null) stats.push(`<div><b>🔥 ${bestEndless}</b>Bester Endlos-Lauf</div>`);
+  if (quotes.length) {
+    stats.push(`<div><b>${Math.max(...quotes)} %</b>Beste Quote</div>`);
+    stats.push(`<div><b>${Math.round(quotes.reduce((a, b) => a + b, 0) / quotes.length)} %</b>Ø Quote</div>`);
+  }
+  $('histStats').innerHTML = stats.join('');
+
+  const shown = histShowAll ? list : list.slice(0, 10);
+  $('histList').innerHTML = shown.map(e => {
+    const isEndless = e.mode === 'endless';
+    const pct = isEndless ? (bestEndless ? Math.round(e.score / bestEndless * 100) : 0) : entryQuality(e);
+    const res = isEndless
+      ? `🔥 ${e.score} in Folge`
+      : `${e.won}/${e.played} erraten<br><span class="muted small" style="font-weight:400">${e.score} Punkte · ${entryQuality(e)} %</span>`;
+    return `<div class="hist-row">
+      <div><b>${esc(e.pl)}</b><span class="tag ${isEndless ? 'endless' : ''}">${isEndless ? 'Endlos' : 'Normal'}</span>
+        <div class="when">${fmtDate(e.t)}</div></div>
+      <div class="res">${res}</div>
+      <div class="meter"><i style="width:${Math.max(2, pct)}%"></i></div>
+    </div>`;
+  }).join('');
+  $('histMore').classList.toggle('hidden', list.length <= 10);
+  $('histMore').textContent = histShowAll ? 'Weniger anzeigen' : `Alle anzeigen (${list.length})`;
+}
+
+function renderModeHelp() {
+  const endless = $('optMode').value === 'endless';
+  $('roundsWrap').classList.toggle('hidden', endless);
+  $('modeHelp').textContent = endless
+    ? 'Endlos: Es geht so lange weiter, bis du einen Song nicht errätst. Jeder erratene Song gibt 1 Punkt. „Länger hören“ und falsche Tipps kosten wie gewohnt eine Chance.'
+    : 'Jede Hörzeit ist eine Chance: Du startest mit 0,5 s. „Länger hören“ oder ein falscher Tipp kostet eine Chance und schaltet die nächste Stufe frei. Je früher du richtig liegst, desto mehr Punkte.';
 }
 
 /* =========================================================
@@ -984,6 +1120,8 @@ async function loadPlaylists() {
     fetchAllPages('/me/playlists?limit=50', (n, t) => { $('loadingText').textContent = `Lade deine Playlists … ${n}/${t}`; }),
   ]);
   $('userName').textContent = me.display_name || me.id;
+  meId = me.id;
+  renderHistory();
   if (me.images?.[0]?.url) $('userImg').src = me.images[0].url; else $('userImg').classList.add('hidden');
   $('userBox').classList.remove('hidden');
   $('volBox').classList.remove('hidden');
@@ -1028,6 +1166,17 @@ $('volSlider').oninput = e => setVolumeLevel(Number(e.target.value) / 100);
 $('volIcon').onclick = () => setVolumeLevel(VOLUME > 0 ? 0 : volBeforeMute);
 
 $('plSearch').oninput = renderPlaylists;
+
+// Modus merken & Hilfetext
+try { const m = store.get('sr_mode'); if (m === 'endless' || m === 'normal') $('optMode').value = m; } catch {}
+$('optMode').onchange = () => { store.set('sr_mode', $('optMode').value); renderModeHelp(); };
+renderModeHelp();
+$('histMore').onclick = () => { histShowAll = !histShowAll; renderHistory(); };
+$('histClear').onclick = () => {
+  if (confirm('Deinen ganzen Verlauf in diesem Browser löschen? Das kann nicht rückgängig gemacht werden.')) {
+    store.del(histKey()); histShowAll = false; renderHistory();
+  }
+};
 $('plGrid').onclick = e => {
   const btn = e.target.closest('.pl');
   if (!btn) return;
@@ -1040,7 +1189,7 @@ $('playBtn').onclick = () => { player?.activateElement?.(); snippetBusy ? stopSn
 $('guessBtn').onclick = submitGuess;
 $('skipBtn').onclick = skip;
 $('giveUpBtn').onclick = () => { if (game?.cur && !game.cur.done) reveal(false); };
-$('nextBtn').onclick = () => { if (game.round >= game.totalRounds) endGame(); else nextRound(); };
+$('nextBtn').onclick = () => { if (isGameFinished()) endGame(); else nextRound(); };
 $('pauseBtn').onclick = async () => {
   const s = await player.getCurrentState();
   if (s?.paused) { await player.resume(); $('pauseBtn').textContent = 'Pause'; }
