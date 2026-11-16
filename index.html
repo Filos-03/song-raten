@@ -98,6 +98,7 @@
   .suggest div:last-child { border-bottom: 0; }
   .suggest div.active, .suggest div:hover { background: #2b313c; }
   .suggest small { color: var(--muted); }
+  .suggest .sug-count { margin: 0; padding: 6px 14px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; }
   .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
   .actions button { flex: 1 1 auto; }
   .attempts { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 6px; }
@@ -698,7 +699,7 @@ async function startGame(pl) {
   // Vorschlagsliste (eindeutig nach Titel + Interpret)
   const map = new Map();
   tracks.forEach(t => { const k = norm(t.name) + '|' + norm(t.artists); if (!map.has(k)) map.set(k, t); });
-  game.options = [...map.values()].map(t => ({ ...t, hay: (t.name + ' ' + t.artists).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '') }));
+  game.options = [...map.values()].map(t => ({ ...t, nameN: t.name.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''), hay: (t.name + ' ' + t.artists).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '') }));
   nextRound();
 }
 
@@ -1078,17 +1079,23 @@ function updateSuggest() {
   const q = input.value.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
   if (q.length < 1 || !game) return hideSuggest();
   const words = q.split(/\s+/);
+  // Alle Treffer (auch alle Songs eines Künstlers), Titel-Treffer zuerst
+  const rank = o => o.nameN.startsWith(q) ? 0 : words.every(w => o.nameN.includes(w)) ? 1 : 2;
   sugItems = game.options.filter(o => words.every(w => o.hay.includes(w)))
-    .sort((a, b) => (b.hay.startsWith(q) - a.hay.startsWith(q)) || a.name.localeCompare(b.name))
-    .slice(0, 8);
+    .map(o => [rank(o), o])
+    .sort((a, b) => (a[0] - b[0]) || a[1].name.localeCompare(b[1].name, 'de'))
+    .map(x => x[1])
+    .slice(0, 200);
   if (!sugItems.length) return hideSuggest();
   sugIndex = -1;
   renderSuggest();
 }
 function renderSuggest() {
   const box = $('suggest');
-  box.innerHTML = sugItems.map((o, i) => `<div data-i="${i}" class="${i === sugIndex ? 'active' : ''}">${esc(o.name)} <small>– ${esc(o.artists)}</small></div>`).join('');
+  const head = sugItems.length > 5 ? `<p class="sug-count">${sugItems.length} Treffer – scrollen für mehr</p>` : '';
+  box.innerHTML = head + sugItems.map((o, i) => `<div data-i="${i}" class="${i === sugIndex ? 'active' : ''}">${esc(o.name)} <small>– ${esc(o.artists)}</small></div>`).join('');
   box.classList.remove('hidden');
+  box.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
 }
 function pickSuggest(i) {
   const o = sugItems[i];
